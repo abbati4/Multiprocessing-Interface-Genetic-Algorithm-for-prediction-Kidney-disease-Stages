@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project presents a complete machine learning pipeline for predicting disease stages using the MIGA dataset. The pipeline includes data preprocessing, feature engineering, model training, and performance evaluation. The objective is to develop an accurate and reliable predictive model that can assist in automated disease stage classification and decision support.
+This project presents a complete machine learning pipeline for predicting disease stages using Multilayer Perceptron optimised with Multiprocessing Interface Genetic Algorithm (MIGA), the MIGA is a modified Genetic algorithm for hyperparameter tuning.  The pipeline includes data preprocessing, feature engineering, model training, and performance evaluation. The objective is to develop an accurate and reliable predictive model that can assist in automated disease stage classification and decision support.
 
 This project demonstrates practical implementation of machine learning techniques using Python and standard data science libraries.
 
@@ -12,7 +12,7 @@ This project demonstrates practical implementation of machine learning technique
 
 The main objectives of this project are:
 
-* To preprocess and clean the raw MIGA dataset
+* To preprocess and clean the raw CKD dataset
 * To perform feature selection and transformation
 * To train machine learning models for stage prediction
 * To evaluate model performance using standard evaluation metrics
