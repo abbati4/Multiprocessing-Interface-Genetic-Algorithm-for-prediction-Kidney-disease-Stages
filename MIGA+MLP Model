@@ -1,0 +1,264 @@
+import os
+import time
+import random
+import joblib
+import psutil
+import numpy as np
+import pandas as pd
+import concurrent.futures
+import matplotlib.pyplot as plt
+import shap
+
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import KernelPCA
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, log_loss, classification_report, confusion_matrix
+from imblearn.over_sampling import SMOTE  # for balancing classes
+
+def run_tuning(
+    dataset_path: str,
+    target_var: str,
+    hidden_layer_sizes: list,
+    activation_functions: list,
+    learning_rates: list,
+    solvers: list,
+    pop_size: int = 10,
+    generations: int = 10,
+    kpca_gamma: float = None,  # optional RBF width for KPCA
+):
+    # --- Load & preprocess ---
+    df = pd.read_csv(dataset_path)
+    cat_cols = df.select_dtypes(include=['object','category']).columns.tolist()
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_var in cat_cols: cat_cols.remove(target_var)
+    if target_var in num_cols: num_cols.remove(target_var)
+
+    for col in cat_cols:
+        df[col] = LabelEncoder().fit_transform(df[col].astype(str))
+    df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+    df.fillna(0, inplace=True)
+
+    X = df[num_cols + cat_cols]
+    y = df[target_var]
+
+    # --- Train/test split & scale ---
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    scaler = StandardScaler().fit(X_train_raw)
+    X_train_scaled = scaler.transform(X_train_raw)
+    X_test_scaled  = scaler.transform(X_test_raw)
+
+    # --- Kernel PCA on all features, then select by 95% variance ---
+    kpca = KernelPCA(
+        kernel='sigmoid',
+        n_components=X_train_scaled.shape[1],
+        gamma=kpca_gamma
+    )
+    X_train_kpca = kpca.fit_transform(X_train_scaled)
+    X_test_kpca  = kpca.transform(X_test_scaled)
+
+    eigs = kpca.eigenvalues_
+    cum_explained = np.cumsum(eigs) / np.sum(eigs)
+    n_comp = int(np.searchsorted(cum_explained, 0.95) + 1)
+    component_names = [f"PC{i+1}" for i in range(n_comp)]
+
+    # Plot cumulative explained variance
+    plt.figure()
+    plt.plot(np.arange(1, len(cum_explained)+1), cum_explained, marker='o')
+    plt.axhline(0.95, linestyle='--', color='red', label='95% threshold')
+    plt.title("KPCA: Cumulative Explained Variance")
+    plt.xlabel("Component #")
+    plt.ylabel("Cumulative Variance")
+    plt.legend()
+    plt.show()
+
+    # Plot first two components scatter
+    if n_comp >= 2:
+        plt.figure()
+        for cls in np.unique(y_train):
+            mask = (y_train == cls)
+            plt.scatter(X_train_kpca[mask,0], X_train_kpca[mask,1], label=str(cls), alpha=0.7)
+        plt.title("KPCA: First Two Components")
+        plt.xlabel("PC1")
+        plt.ylabel("PC2")
+        plt.legend()
+        plt.show()
+
+    print(f"Selected {n_comp} components → {component_names}\n")
+
+    X_train_final = X_train_kpca[:, :n_comp]
+    X_test_final  = X_test_kpca[:, :n_comp]
+
+    # --- Balance classes via SMOTE ---
+    sm = SMOTE(random_state=42)
+    X_train_final, y_train = sm.fit_resample(X_train_final, y_train)
+
+    # --- Fitness function (no sample_weight) ---
+    def fitness(params):
+        mdl = MLPClassifier(
+            hidden_layer_sizes=params[0],
+            activation=params[1],
+            solver=params[3],
+            learning_rate_init=params[2],
+            alpha=0.0001,
+            learning_rate='adaptive',
+            early_stopping=True,
+            n_iter_no_change=10,
+            random_state=42,
+            max_iter=500
+        )
+        mdl.fit(X_train_final, y_train)
+        return accuracy_score(y_test, mdl.predict(X_test_final))
+
+    # --- GA executor (serial vs parallel) ---
+    def run_ga(parallel: bool):
+        proc = psutil.Process()
+        mem0 = proc.memory_info().rss
+        pop = [[
+            random.choice(hidden_layer_sizes),
+            random.choice(activation_functions),
+            random.choice(learning_rates),
+            random.choice(solvers)
+        ] for _ in range(pop_size)]
+        best_score, best_ind = 0.0, None
+        best_scores, avg_scores = [], []
+
+        t0 = time.time()
+        for gen in range(1, generations+1):
+            if parallel:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+                    fits = list(ex.map(fitness, pop))
+            else:
+                fits = [fitness(ind) for ind in pop]
+
+            gen_best, gen_avg = max(fits), float(np.mean(fits))
+            best_scores.append(gen_best)
+            avg_scores.append(gen_avg)
+            if gen_best >= best_score:
+                best_score, best_ind = gen_best, pop[fits.index(gen_best)]
+            print(f"{'PAR' if parallel else 'SER'} Gen {gen}: best={gen_best:.4f}, avg={gen_avg:.4f}")
+
+            # reproduction
+            ranked = [ind for _,ind in sorted(zip(fits,pop), reverse=True)]
+            selected = ranked[:pop_size//2]
+            new_pop = selected.copy()
+            while len(new_pop) < pop_size:
+                p1, p2 = random.sample(selected, 2)
+                child = [random.choice([p1[i],p2[i]]) for i in range(4)]
+                if random.random() < 0.1:
+                    idx = random.randrange(4)
+                    child[idx] = random.choice(
+                        [hidden_layer_sizes, activation_functions, learning_rates, solvers][idx]
+                    )
+                new_pop.append(child)
+            pop = new_pop
+
+        duration = time.time() - t0
+        mem1     = proc.memory_info().rss
+        return {
+            'best_ind': best_ind,
+            'best_score': best_score,
+            'best_scores': best_scores,
+            'avg_scores': avg_scores,
+            'time': duration,
+            'mem_delta_mb': (mem1 - mem0) / 1e6
+        }
+
+    # --- Run both variants ---
+    print(">> Running parallel GA …")
+    par = run_ga(parallel=True)
+    print(">> Running serial GA …")
+    ser = run_ga(parallel=False)
+
+    # Compare times & memory
+    print(f"\nParallel GA: time={par['time']:.2f}s  Δmem={par['mem_delta_mb']:.1f}MB  best={par['best_score']:.4f}")
+    print(f"   Serial:   time={ser['time']:.2f}s  Δmem={ser['mem_delta_mb']:.1f}MB  best={ser['best_score']:.4f}\n")
+
+    # Convergence plot
+    gens = np.arange(1, generations+1)
+    plt.figure()
+    plt.plot(gens, par['best_scores'], label='Parallel best')
+    plt.plot(gens, ser['best_scores'], '--', label='Serial best')
+    plt.xlabel("Generation")
+    plt.ylabel("Accuracy")
+    plt.title("GA Convergence: Parallel vs Serial")
+    plt.legend()
+    plt.show()
+
+    # Optimal parameters
+    best = par['best_ind']
+    print(f"Optimal params (parallel GA): {best}\n")
+
+    # Train/test loss over epochs
+    model = MLPClassifier(
+        hidden_layer_sizes=best[0],
+        activation=best[1],
+        learning_rate_init=best[2],
+        solver=best[3],
+        max_iter=1,
+        warm_start=True
+    )
+    train_losses, test_losses = [], []
+    for e in range(1, 101):
+        model.fit(X_train_final, y_train)
+        train_losses.append(model.loss_)
+        prob_test = model.predict_proba(X_test_final)
+        test_losses.append(log_loss(y_test, prob_test))
+
+    plt.figure()
+    plt.plot(range(1, 101), train_losses, label='Train loss')
+    plt.plot(range(1, 101), test_losses, label='Test loss')
+    plt.xlabel("Epoch")
+    plt.ylabel("Log Loss")
+    plt.title("Train vs Test Loss")
+    plt.legend()
+    plt.show()
+
+    # SHAP component importances
+    background = X_train_final[np.random.choice(X_train_final.shape[0],
+                     min(100, X_train_final.shape[0]), replace=False)]
+    explainer = shap.KernelExplainer(model.predict_proba, background)
+    sv = explainer.shap_values(X_test_final[:50])
+    if isinstance(sv, list) and len(sv) == 2:
+        shap_arr = sv[1]
+    else:
+        shap_arr = np.array(sv)
+    if shap_arr.ndim == 3:
+        if shap_arr.shape[2] == 2:
+            shap_arr = shap_arr[:, :, 1]
+        else:
+            shap_arr = shap_arr.mean(axis=2)
+    mean_abs = np.mean(np.abs(shap_arr), axis=0)
+    plt.figure(figsize=(8,4))
+    plt.bar(component_names, mean_abs)
+    plt.xticks(rotation=45)
+    plt.ylabel("Mean |SHAP value|")
+    plt.title("KPCA Component Importances")
+    plt.tight_layout()
+    plt.show()
+
+    # Final evaluation & save
+    y_pred = model.predict(X_test_final)
+    print("Test Accuracy:", accuracy_score(y_test, y_pred))
+    print("Classification Report:\n", classification_report(y_test, y_pred))
+    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
+    joblib.dump(model, "best_model.pkl")
+    print("Saved best_model.pkl")
+
+    return par, ser
+
+if __name__ == "__main__"::
+    run_tuning(
+        dataset_path="E:/updated_ckd_dataset_with_stagesStage1.csv",
+        target_var="ckd_stage",
+        hidden_layer_sizes=[(50,), (100,), (150,), (50,50), (100,50),(150,50),(250,100),(250,)],
+        activation_functions=["relu", "tanh", "logistic"],
+        learning_rates=[0.001, 0.01, 0.1],
+        solvers=["adam", "sgd"],
+        pop_size=10,
+        generations=10,
+        kpca_gamma=None
+    )
+
