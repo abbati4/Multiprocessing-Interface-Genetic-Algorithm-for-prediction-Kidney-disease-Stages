@@ -1,0 +1,68 @@
+# If you haven’t installed imbalanced-learn yet, uncomment the next line:
+# %pip install imbalanced-learn
+
+import pandas as pd
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from imblearn.over_sampling import SMOTE
+
+# Paths and target
+input_csv  = 'E:/updated_ckd_dataset_with_stages.csv'
+output_csv = 'E:/updated_ckd_dataset_with_stagesNo1.csv'
+target_col = 'ckd_pred' # change this if your target column is named differently
+
+# Load original dataset
+df = pd.read_csv(input_csv)
+
+# Summary before cleaning
+print("=== Before Cleaning ===")
+print(f"Shape: {df.shape}\n")
+print("Descriptive statistics (including categorical):")
+print(df.describe(include='all'))
+print("\nFirst 5 rows:")
+print(df.head())
+print("\nTarget distribution:")
+print(df[target_col].value_counts())
+
+# Cleaning pipeline
+X = df.drop(columns=[target_col])
+y = df[target_col].astype(str)
+
+# Encode categorical features
+X_encoded = X.copy()
+for col in X_encoded.select_dtypes(include=['object']).columns:
+    X_encoded[col] = LabelEncoder().fit_transform(X_encoded[col].astype(str))
+
+# Encode target
+le_target = LabelEncoder()
+y_encoded = le_target.fit_transform(y)
+
+# Impute missing values with KNN
+imputer = KNNImputer(n_neighbors=5)
+X_imputed = pd.DataFrame(imputer.fit_transform(X_encoded), columns=X_encoded.columns)
+
+# Scale features
+scaler = StandardScaler()
+X_scaled = pd.DataFrame(scaler.fit_transform(X_imputed), columns=X_imputed.columns)
+
+# Balance classes with SMOTE
+smote = SMOTE(random_state=42)
+X_res, y_res = smote.fit_resample(X_scaled, y_encoded)
+
+# Reassemble cleaned DataFrame
+df_clean = pd.DataFrame(X_res, columns=X_scaled.columns)
+df_clean[target_col] = le_target.inverse_transform(y_res)
+
+# Summary after cleaning
+print("\n=== After Cleaning ===")
+print(f"Shape: {df_clean.shape}\n")
+print("Descriptive statistics (including categorical):")
+print(df_clean.describe(include='all'))
+print("\nFirst 5 rows:")
+print(df_clean.head())
+print("\nTarget distribution:")
+print(df_clean[target_col].value_counts())
+
+# Save cleaned dataset
+df_clean.to_csv(output_csv, index=False)
+print(f"\n✅ Cleaned dataset saved to: {output_csv}")
